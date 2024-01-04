@@ -11,7 +11,12 @@ class TNHelper:
 
     @staticmethod
     def is_triu_matrix(mat):
-        return np.allclose(mat, np.triu(mat))
+        try:
+            return np.allclose(mat, np.triu(mat))
+        except:
+            dim = mat.shape[0]
+            return np.all(mat[np.tril_indices(dim, -1)] == '0')
+                
 
     @staticmethod
     def to_full(mat):
@@ -31,9 +36,9 @@ class TNHelper:
             return np.triu(mat)
 
     @staticmethod
-    def adjm_to_expr(adjm):
+    def adjm_to_expr(adjm, only_cores=True, batch_first=True):
         adjm = TNHelper.to_triu(adjm)
-        adjm_str = adjm.astype(str)
+        adjm_str = adjm.astype(int).astype(str)
         adjm_diag = np.copy(np.diag(adjm_str))
         np.fill_diagonal(adjm_str, '0')
         
@@ -56,8 +61,23 @@ class TNHelper:
         np.fill_diagonal(adjm_str, adjm_diag)
 
         einsum_str = []
-        for a in adjm_str:
-            einsum_str.append(''.join([ x for x in a if x.__ne__('0')]))
+        
+        if only_cores:
+            for a in adjm_str:
+                einsum_str.append(''.join([ x for x in a if x.__ne__('0')]))
+        else:
+            if batch_first:
+                src = [(j, 0) for j in range(1, adjm_str.shape[0])]
+                dst = [(j, j) for j in range(1, adjm_str.shape[0])]
+            else:
+                src = [(j, -1) for j in range(0, adjm_str.shape[0]-1)]
+                dst = [(j, j) for j in range(0, adjm_str.shape[0]-1)]
+            
+            adjm_str[[(s[0]) for s in src+dst], [(s[1]) for s in src+dst]] = adjm_str[[(s[0]) for s in dst+src], [(s[1]) for s in dst+src]]
+            
+            for a in adjm_str:
+                einsum_str.append(''.join([ x for x in a if x.__ne__('0')]))
+            
         adjm_diag = ''.join([ x for x in adjm_diag if x.__ne__('0')])
         einsum_str = f'{",".join(einsum_str)}->{adjm_diag}'
 
@@ -66,7 +86,7 @@ class TNHelper:
     @staticmethod
     def expand_adj_matrix(adj_matrix, target, batch_first=True):
         
-        batch_size = target[0] if batch_first else target[-1]
+        batch_size = target.shape[0] if batch_first else target.shape[-1]
         adj_matrix = TNHelper.to_triu(adj_matrix)
         if batch_first:
             new_adj_matrix = np.c_[np.zeros((adj_matrix.shape[0]+1, 1)), np.r_[np.diag(adj_matrix)[np.newaxis, :], adj_matrix]]
@@ -78,7 +98,23 @@ class TNHelper:
             new_adj_matrix[-1, -1] = batch_size
 
         return TNHelper.to_full(new_adj_matrix)
-
+    
+    @staticmethod
+    def expr_shape_feeder(adj_matrix, only_cores=True, batch_first=True):
+        if only_cores:
+            return [ s[s!=0] for s in np.vsplit(adj_matrix, adj_matrix.shape[0]) ]
+        else:
+            adjm = np.copy(adj_matrix)
+            if batch_first:
+                src = [(j, 0) for j in range(1, adj_matrix.shape[0])]
+                dst = [(j, j) for j in range(1, adj_matrix.shape[0])]
+            else:
+                src = [(j, -1) for j in range(0, adj_matrix.shape[0]-1)]
+                dst = [(j, j) for j in range(0, adj_matrix.shape[0]-1)]
+            
+            adjm[[(s[0]) for s in src+dst], [(s[1]) for s in src+dst]] = adjm[[(s[0]) for s in dst+src], [(s[1]) for s in dst+src]]
+            return [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
+            
 class TensorNetwork:
 
     def init_cores(self, adj_matrix, initializer) -> None:
@@ -120,7 +156,7 @@ class TensorNetwork:
         if not self.einsum_expr:
             einsum_str = TNHelper.adjm_to_expr(self.adj_matrix)
             adjm = TNHelper.to_full(self.adj_matrix)
-            shapes = [ s[s!=0] for s in np.vsplit(adjm, self.dim) ]
+            shapes = TNHelper.expr_shape_feeder(adjm)
 
             # 'dp' 'auto-hq'
             self.einsum_expr = opt_einsum.contract_expression(einsum_str, *shapes, optimize=optimize)
@@ -131,6 +167,9 @@ class TensorNetwork:
 
     def target_retraction(self, target, batch_first=True, optimize='dp', return_retr=True):
 
+        print(self.einsum_target_expr)
+        print(target.shape)
+        print(self.target_shape)
         ## initialization or target_shape (batch size) changed
         if not (self.einsum_target_expr and target.shape == self.target_shape):
 
@@ -138,17 +177,17 @@ class TensorNetwork:
             adjm_diag = np.diag(self.adj_matrix)
             adjm_diag_nonzero = adjm_diag[adjm_diag!=0]
             if batch_first:
-                if not adjm_diag_nonzero == target[1:]:
+                if not adjm_diag_nonzero.tolist() == list(target.shape[1:]):
                     raise ValueError('Target shape not equal to diag of adjm.')
             else:
-                if not adjm_diag_nonzero == target[:-1]:
+                if not adjm_diag_nonzero.tolist() == list(target.shape[:-1]):
                     raise ValueError('Target shape not equal to diag of adjm.')
 
             self.target_shape = target.shape
             expanded_adj_matrix = TNHelper.expand_adj_matrix(self.adj_matrix, target, batch_first)
-            einsum_str = TNHelper.adjm_to_expr(expanded_adj_matrix)
+            einsum_str = TNHelper.adjm_to_expr(expanded_adj_matrix, False, batch_first)
             adjm = TNHelper.to_full(expanded_adj_matrix)
-            shapes = [ s[s!=0] for s in np.vsplit(adjm, self.dim) ]
+            shapes = TNHelper.expr_shape_feeder(adjm, False, batch_first)
             self.einsum_target_expr = opt_einsum.contract_expression(einsum_str, *shapes, optimize=optimize)
             self.jit_target_retraction = jax.jit(self.einsum_target_expr)
 
@@ -176,28 +215,30 @@ class TensorNetwork:
                     retract_target_TN = self.einsum_target_expr(target, *cores)
                 else:
                     retract_target_TN = self.einsum_target_expr(*cores, target)
-
-                mse_loss = jnp.mean(jnp.sum(jnp.square(retract_target_TN - label), axis=-1), axis=0)
+                    
+                mse_loss = jnp.mean(jnp.square(retract_target_TN - label), axis=0)
 
                 return mse_loss
         
             self.jit_target_retraction_gradient = jax.jit(jax.grad(expr_with_mse_loss))
             self.jit_target_retraction_value_gradient = jax.jit(jax.value_and_grad(expr_with_mse_loss))
+            
 
         ## This calculate the gradient
         if verbose:
+            loss, grad_cores = self.jit_target_retraction_value_gradient(self.cores, target, label)
+        else:
             grad_cores = self.jit_target_retraction_gradient(self.cores, target, label)
             loss = None
-        else:
-            loss, grad_cores = self.jit_target_retraction_value_gradient(self.cores, target, label)
 
         return loss, grad_cores
 
     def gradient_descent(self, learning_rate, grad_cores):
 
         ## change this function for different update rules
-        grad = self.trainable_list * grad_cores * learning_rate
-        self.cores -= grad
+        for idx, (t, g) in enumerate(zip(self.trainable_list, grad_cores)):
+            if t:
+                self.cores[idx] -= learning_rate * g
         
         return
 
@@ -209,3 +250,15 @@ class TensorNetwork:
             return loss
         else:
             return None
+        
+
+if __name__ == '__main__':
+    adjm = np.array([
+        [500,   2,   2,   2,   2,],
+        [  2,   0,   3,   4,   0,],
+        [  2,   3,   0,   3,   4,],
+        [  2,   4,   3,   0,   3,],
+        [  2,   0,   4,   3,   0,]])
+    
+    x = TNHelper.adjm_to_expr(adjm)
+    print(x)
