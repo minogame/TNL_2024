@@ -64,8 +64,9 @@ class TNHelper:
         return einsum_str
 
     @staticmethod
-    def expand_adj_matrix(adj_matrix, batch_size, batch_first=True):
-
+    def expand_adj_matrix(adj_matrix, target, batch_first=True):
+        
+        batch_size = target[0] if batch_first else target[-1]
         adj_matrix = TNHelper.to_triu(adj_matrix)
         if batch_first:
             new_adj_matrix = np.c_[np.zeros((adj_matrix.shape[0]+1, 1)), np.r_[np.diag(adj_matrix)[np.newaxis, :], adj_matrix]]
@@ -93,6 +94,7 @@ class TensorNetwork:
 
         if trainable_list is None:
             self.trainable_list = [True] * self.dim
+        self.trainable_list = [int(t) for t in self.trainable_list]
 
         if initializer is None:
             initializer = np.random.rand
@@ -103,6 +105,10 @@ class TensorNetwork:
         self.einsum_expr = None
         self.einsum_target_expr = None
         self.target_shape = None
+        self.jit_retraction = None
+        self.jit_target_retraction = None
+        self.jit_target_retraction_gradient = None
+        self.jit_target_retraction_value_gradient = None
 
     def giff_cores(self, idx=None):
         if idx is None or idx >= self.dim:
@@ -118,52 +124,88 @@ class TensorNetwork:
 
             # 'dp' 'auto-hq'
             self.einsum_expr = opt_einsum.contract_expression(einsum_str, *shapes, optimize=optimize)
+            self.jit_retraction = jax.jit(self.einsum_expr)
 
-        jit_foo = jax.jit(self.einsum_expr)
-        retract_TN = jit_foo(*self.cores)
+        retract_TN = self.jit_retraction(*self.cores)
         return retract_TN
 
-    def fit_target(self, target, batch_first=True, optimize='dp'):
+    def target_retraction(self, target, batch_first=True, optimize='dp', return_retr=True):
 
+        ## initialization or target_shape (batch size) changed
         if not (self.einsum_target_expr and target.shape == self.target_shape):
-            ## initialization or target_shape (batch size) changed
-            self.target_shape = target.shape
-            self.einsum_target_expr = opt_einsum.contract_expression(self.einsum_str, *shapes, optimize=optimize)
 
-
+            ## check if the adj_matrix's output fit the target (without batchsize.)
             adjm_diag = np.diag(self.adj_matrix)
             adjm_diag_nonzero = adjm_diag[adjm_diag!=0]
             if batch_first:
-                if adjm_diag_nonzero
+                if not adjm_diag_nonzero == target[1:]:
+                    raise ValueError('Target shape not equal to diag of adjm.')
+            else:
+                if not adjm_diag_nonzero == target[:-1]:
+                    raise ValueError('Target shape not equal to diag of adjm.')
 
+            self.target_shape = target.shape
+            expanded_adj_matrix = TNHelper.expand_adj_matrix(self.adj_matrix, target, batch_first)
+            einsum_str = TNHelper.adjm_to_expr(expanded_adj_matrix)
+            adjm = TNHelper.to_full(expanded_adj_matrix)
+            shapes = [ s[s!=0] for s in np.vsplit(adjm, self.dim) ]
+            self.einsum_target_expr = opt_einsum.contract_expression(einsum_str, *shapes, optimize=optimize)
+            self.jit_target_retraction = jax.jit(self.einsum_target_expr)
 
-        jit_foo = jax.jit(self.einsum_target_expr)
-        retract_TN = jit_foo(*self.cores)
+            if not return_retr:
+                return True
 
+        if return_retr:
+            if batch_first:
+                retract_target_TN = self.jit_target_retraction(target, *self.cores)
+            else:
+                retract_target_TN = self.jit_target_retraction(*self.cores, target)
+
+            return retract_target_TN
         else:
+            return False
+
+    def target_retraction_grads(self, target, label, batch_first=True, optimize='dp', verbose=False):
+        ## call target_retraction for initialization
+        ## True if initialization is conducted, so we need to initilize jax.grad here
+        if self.target_retraction(target, batch_first, optimize, False):
+
+            ## change the loss function below
+            def expr_with_mse_loss(cores, target, label):
+                if batch_first:
+                    retract_target_TN = self.einsum_target_expr(target, *cores)
+                else:
+                    retract_target_TN = self.einsum_target_expr(*cores, target)
+
+                mse_loss = jnp.mean(jnp.sum(jnp.square(retract_target_TN - label), axis=-1), axis=0)
+
+                return mse_loss
         
-        return retract_TN
+            self.jit_target_retraction_gradient = jax.jit(jax.grad(expr_with_mse_loss))
+            self.jit_target_retraction_value_gradient = jax.jit(jax.value_and_grad(expr_with_mse_loss))
 
-        if not np.allclose(adjm_diag_nonzero, target):
-            raise ValueError
+        ## This calculate the gradient
+        if verbose:
+            grad_cores = self.jit_target_retraction_gradient(self.cores, target, label)
+            loss = None
+        else:
+            loss, grad_cores = self.jit_target_retraction_value_gradient(self.cores, target, label)
 
-        pass
+        return loss, grad_cores
 
-    def giff_grads(self, ):
-        def expr_mae(x):
-            x = expr(*x)
-            return jnp.sum(x)
+    def gradient_descent(self, learning_rate, grad_cores):
+
+        ## change this function for different update rules
+        grad = self.trainable_list * grad_cores * learning_rate
+        self.cores -= grad
         
-        jit_dfoo = jax.jit(jax.grad(expr_mae))
-        z = jit_dfoo(cores)
+        return
 
-        print(len(z))
-        print(z[0].shape)
+    def iteration(self, learning_rate, target, label, batch_first=True, optimize='dp', verbose=False):
+        loss, grad_cores = self.target_retraction_grads(target, label, batch_first, optimize, verbose)
+        self.gradient_descent(learning_rate, grad_cores)
 
-
-    def gradient_descent(self, learning_rate):
-        self.a
-        pass
-
-    def opt_opeartions(self, opt, loss):
-        return opt.minimize(loss, var_list=tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES))
+        if verbose:
+            return loss
+        else:
+            return None
