@@ -167,9 +167,6 @@ class TensorNetwork:
 
     def target_retraction(self, target, batch_first=True, optimize='dp', return_retr=True):
 
-        print(self.einsum_target_expr)
-        print(target.shape)
-        print(self.target_shape)
         ## initialization or target_shape (batch size) changed
         if not (self.einsum_target_expr and target.shape == self.target_shape):
 
