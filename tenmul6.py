@@ -4,7 +4,7 @@ import numpy as np
 import jax.numpy as jnp
 
 
-class TNHelper:
+class NCTNHelper:
 
     ## The helper class for TensorNetwork,
     ## contains utilizations.
@@ -20,7 +20,7 @@ class TNHelper:
 
     @staticmethod
     def to_full(mat):
-        if TNHelper.is_triu_matrix(mat):
+        if NCTNHelper.is_triu_matrix(mat):
             dim = mat.shape[0]
             mat_return = np.copy(mat)
             mat_return[np.tril_indices(dim, -1)] = mat_return.transpose()[np.tril_indices(dim, -1)]
@@ -30,26 +30,18 @@ class TNHelper:
     
     @staticmethod
     def to_triu(mat):
-        if TNHelper.is_triu_matrix(mat):
+        if NCTNHelper.is_triu_matrix(mat):
             return mat
         else:
             return np.triu(mat)
 
     @staticmethod
-    def adjm_to_expr(adjm, only_cores=True, batch_first=True):
-        adjm = TNHelper.to_triu(adjm)
+    def adjm_to_expr(adjm):
+        adjm = NCTNHelper.to_triu(adjm)
         adjm_str = adjm.astype(int).astype(str)
-        adjm_diag = np.copy(np.diag(adjm_str))
         np.fill_diagonal(adjm_str, '0')
-        
-        symbol_id = 0
-        for i in np.ndindex(adjm_diag.shape):
-            if adjm_diag[i] == '0':
-                continue
-            else:
-                adjm_diag[i] = opt_einsum.get_symbol(symbol_id)
-                symbol_id += 1
 
+        symbol_id = 1
         for i, j in np.ndindex(adjm_str.shape):
             if adjm_str[i,j] == '0':
                 continue
@@ -57,63 +49,34 @@ class TNHelper:
                 adjm_str[i,j] = opt_einsum.get_symbol(symbol_id)
                 symbol_id += 1
 
-        adjm_str = TNHelper.to_full(adjm_str)
+        adjm_str = NCTNHelper.to_full(adjm_str)
         np.fill_diagonal(adjm_str, adjm_diag)
 
+        ## in the the NCTN.span_cores, the last dimension is always "batch"
+        ## so we append batch to all the shapes, and the retraction result is also batch
         einsum_str = []
-        
-        if only_cores:
-            for a in adjm_str:
-                einsum_str.append(''.join([ x for x in a if x.__ne__('0')]))
-        else:
-            if batch_first:
-                src = [(j, 0) for j in range(1, adjm_str.shape[0])]
-                dst = [(j, j) for j in range(1, adjm_str.shape[0])]
-            else:
-                src = [(j, -1) for j in range(0, adjm_str.shape[0]-1)]
-                dst = [(j, j) for j in range(0, adjm_str.shape[0]-1)]
-            
-            adjm_str[[(s[0]) for s in src+dst], [(s[1]) for s in src+dst]] = adjm_str[[(s[0]) for s in dst+src], [(s[1]) for s in dst+src]]
-            
-            for a in adjm_str:
-                einsum_str.append(''.join([ x for x in a if x.__ne__('0')]))
-            
-        adjm_diag = ''.join([ x for x in adjm_diag if x.__ne__('0')])
+        for a in adjm_str:
+            einsum_str.append(''.join([ x for x in a if x.__ne__('0')]) + opt_einsum.get_symbol(0))
+
+        adjm_diag = opt_einsum.get_symbol(0)
         einsum_str = f'{",".join(einsum_str)}->{adjm_diag}'
 
         return einsum_str
 
     @staticmethod
-    def expand_adj_matrix(adj_matrix, target, batch_first=True):
+    def span_cores(weight, bias, target, activation=jnp.tanh):
         
-        batch_size = target.shape[0] if batch_first else target.shape[-1]
-        adj_matrix = TNHelper.to_triu(adj_matrix)
-        if batch_first:
-            new_adj_matrix = np.c_[np.zeros((adj_matrix.shape[0]+1, 1)), np.r_[np.diag(adj_matrix)[np.newaxis, :], adj_matrix]]
-            np.fill_diagonal(new_adj_matrix, 0)
-            new_adj_matrix[0, 0] = batch_size
-        else:
-            new_adj_matrix = np.r_[np.c_[adj_matrix, np.diag(adj_matrix)], np.zeros((1, adj_matrix.shape[0]+1))]
-            np.fill_diagonal(new_adj_matrix, 0)
-            new_adj_matrix[-1, -1] = batch_size
-
-        return TNHelper.to_full(new_adj_matrix)
+        ## target is in shape (batch, feature, dimension)
+        target_splits = np.split(target, target.shape[0], axis=1)
+        return [ activation(jnp.einsum('...s,bs->...b', w, t) + b) for w, b, t in zip(weight, bias, target_splits)]
     
     @staticmethod
-    def expr_shape_feeder(adj_matrix, only_cores=True, batch_first=True):
-        if only_cores:
-            return [ s[s!=0] for s in np.vsplit(adj_matrix, adj_matrix.shape[0]) ]
-        else:
-            adjm = np.copy(adj_matrix)
-            if batch_first:
-                src = [(j, 0) for j in range(1, adj_matrix.shape[0])]
-                dst = [(j, j) for j in range(1, adj_matrix.shape[0])]
-            else:
-                src = [(j, -1) for j in range(0, adj_matrix.shape[0]-1)]
-                dst = [(j, j) for j in range(0, adj_matrix.shape[0]-1)]
-            
-            adjm[[(s[0]) for s in src+dst], [(s[1]) for s in src+dst]] = adjm[[(s[0]) for s in dst+src], [(s[1]) for s in dst+src]]
-            return [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
+    def expr_shape_feeder(adj_m, target):
+        adjm = NCTNHelper.to_full(adj_m)
+        np.fill_diagonal(adjm, 0)
+        
+        return [ s[s!=0] for s in np.vsplit(np.c_[adjm, target.shape[0]], adjm.shape[0]) ]
+        
             
 class NeuroCodingTensorNetwork:
     
@@ -124,16 +87,22 @@ class NeuroCodingTensorNetwork:
     ## 4. Create target shape adj_matrix, with its diagonal elements equal batch size.
     ## 5. Create einsum expression and other things.
 
-    def init_cores(self, adj_matrix, initializer) -> None:
-        adj_matrix = TNHelper.to_full(adj_matrix)
-        self.adj_matrix = adj_matrix
-        core_shapes = [ s[s!=0] for s in np.vsplit(adj_matrix, self.dim) ]
-        self.cores = [initializer(*s) for s in core_shapes]
+    def init_cores_weights(self, adj_matrix, initializer) -> None:
+        adj_matrix = NCTNHelper.to_full(adj_matrix)
+        self.original_adj_matrix = adj_matrix
+        adjm = np.copy(adj_matrix)
+        adjm_diag = np.diag(adjm)
+        np.fill_diagonal(adjm, 0)
+        B_shapes = [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
+        W_shapes = [ s[s!=0] for s in np.vsplit(np.c_[adjm, adjm_diag], adjm.shape[0]) ]
+        self.W = [initializer(*s) for s in W_shapes]
+        self.B = [initializer(*s) for s in B_shapes]
 
-    def __init__(self, adj_matrix, initializer=None, trainable_list=None):
+    def __init__(self, adj_matrix, initializer=None, trainable_list=None, activation=jnp.tanh):
         self.shape = adj_matrix.shape
         assert self.shape[0] == self.shape[1], 'adj_matrix must be a square matrix.'
         self.dim = self.shape[0]
+        self.activation = activation
 
         if trainable_list is None:
             self.trainable_list = [True] * self.dim
@@ -142,84 +111,53 @@ class NeuroCodingTensorNetwork:
         if initializer is None:
             initializer = np.random.rand
 
-        self.init_cores(adj_matrix, initializer)
+        self.init_cores_weights(adj_matrix, initializer)
 
         ## for the retraction recording
-        self.einsum_expr = None
+        ## the retraction einsum_str is always the same one desipte input batch size
+        self.einsum_str = NCTNHelper.adjm_to_expr(self.original_adj_matrix)
+        
         self.einsum_target_expr = None
         self.target_shape = None
-        self.jit_retraction = None
         self.jit_target_retraction = None
         self.jit_target_retraction_gradient = None
         self.jit_target_retraction_value_gradient = None
 
     def giff_cores(self, idx=None):
         if idx is None or idx >= self.dim:
-            return self.cores
+            return self.W, self.B
         else:
-            return self.cores[idx]
+            return self.W[idx], self.B[idx]
+
+    def target_retraction(self, target, optimize='dp', return_retr=True):
         
-    def retraction(self, optimize='dp'):
-        if not self.einsum_expr:
-            einsum_str = TNHelper.adjm_to_expr(self.adj_matrix)
-            adjm = TNHelper.to_full(self.adj_matrix)
-            shapes = TNHelper.expr_shape_feeder(adjm)
-
-            # 'dp' 'auto-hq'
-            self.einsum_expr = opt_einsum.contract_expression(einsum_str, *shapes, optimize=optimize)
-            self.jit_retraction = jax.jit(self.einsum_expr)
-
-        retract_TN = self.jit_retraction(*self.cores)
-        return retract_TN
-
-    def target_retraction(self, target, batch_first=True, optimize='dp', return_retr=True):
-
         ## initialization or target_shape (batch size) changed
         if not (self.einsum_target_expr and target.shape == self.target_shape):
-
-            ## check if the adj_matrix's output fit the target (without batchsize.)
-            adjm_diag = np.diag(self.adj_matrix)
-            adjm_diag_nonzero = adjm_diag[adjm_diag!=0]
-            if batch_first:
-                if not adjm_diag_nonzero.tolist() == list(target.shape[1:]):
-                    raise ValueError('Target shape not equal to diag of adjm.')
-            else:
-                if not adjm_diag_nonzero.tolist() == list(target.shape[:-1]):
-                    raise ValueError('Target shape not equal to diag of adjm.')
-
             self.target_shape = target.shape
-            expanded_adj_matrix = TNHelper.expand_adj_matrix(self.adj_matrix, target, batch_first)
-            einsum_str = TNHelper.adjm_to_expr(expanded_adj_matrix, False, batch_first)
-            adjm = TNHelper.to_full(expanded_adj_matrix)
-            shapes = TNHelper.expr_shape_feeder(adjm, False, batch_first)
-            self.einsum_target_expr = opt_einsum.contract_expression(einsum_str, *shapes, optimize=optimize)
+            
+            shapes = NCTNHelper.expr_shape_feeder(self.original_adj_matrix, target)
+            self.einsum_target_expr = opt_einsum.contract_expression(self.einsum_str, *shapes, optimize=optimize)
             self.jit_target_retraction = jax.jit(self.einsum_target_expr)
 
             if not return_retr:
                 return True
 
+        cores = NCTNHelper.span_cores(self.W, self.B, target, self.activation)
         if return_retr:
-            if batch_first:
-                retract_target_TN = self.jit_target_retraction(target, *self.cores)
-            else:
-                retract_target_TN = self.jit_target_retraction(*self.cores, target)
-
+            retract_target_TN = self.jit_target_retraction(*cores)
             return retract_target_TN
         else:
             return False
 
-    def target_retraction_grads(self, target, label, batch_first=True, optimize='dp', verbose=False):
+    def target_retraction_grads(self, target, label, optimize='dp', verbose=False):
         ## call target_retraction for initialization
         ## True if initialization is conducted, so we need to initilize jax.grad here
-        if self.target_retraction(target, batch_first, optimize, False):
+        if self.target_retraction(target, optimize, False):
 
             ## change the loss function below
-            def expr_with_mse_loss(cores, target, label):
-                if batch_first:
-                    retract_target_TN = self.einsum_target_expr(target, *cores)
-                else:
-                    retract_target_TN = self.einsum_target_expr(*cores, target)
-                    
+            def expr_with_mse_loss(W, B, target, activation, label):
+                cores = NCTNHelper.span_cores(W, B, target, activation)
+                retract_target_TN = self.einsum_target_expr(*cores)
                 mse_loss = jnp.mean(jnp.square(retract_target_TN - label), axis=0)
 
                 return mse_loss
@@ -229,40 +167,29 @@ class NeuroCodingTensorNetwork:
             
 
         ## This calculate the gradient
+        
         if verbose:
-            loss, grad_cores = self.jit_target_retraction_value_gradient(self.cores, target, label)
+            loss, grad_cores = self.jit_target_retraction_value_gradient(self.W, self.B, target, self.activation, label)
         else:
-            grad_cores = self.jit_target_retraction_gradient(self.cores, target, label)
+            grad_cores = self.jit_target_retraction_gradient(self.W, self.B, target, self.activation, label)
             loss = None
 
         return loss, grad_cores
 
-    def gradient_descent(self, learning_rate, grad_cores):
+    # def gradient_descent(self, learning_rate, grad_cores):
 
-        ## change this function for different update rules
-        for idx, (t, g) in enumerate(zip(self.trainable_list, grad_cores)):
-            if t:
-                self.cores[idx] -= learning_rate * g
+    #     ## change this function for different update rules
+    #     for idx, (t, g) in enumerate(zip(self.trainable_list, grad_cores)):
+    #         if t:
+    #             self.cores[idx] -= learning_rate * g
         
-        return
+    #     return
 
-    def iteration(self, learning_rate, target, label, batch_first=True, optimize='dp', verbose=False):
-        loss, grad_cores = self.target_retraction_grads(target, label, batch_first, optimize, verbose)
-        self.gradient_descent(learning_rate, grad_cores)
+    # def iteration(self, learning_rate, target, label, optimize='dp', verbose=False):
+    #     loss, grad_cores = self.target_retraction_grads(target, label, optimize, verbose)
+    #     self.gradient_descent(learning_rate, grad_cores)
 
-        if verbose:
-            return loss
-        else:
-            return None
-        
-
-if __name__ == '__main__':
-    adjm = np.array([
-        [500,   2,   2,   2,   2,],
-        [  2,   0,   3,   4,   0,],
-        [  2,   3,   0,   3,   4,],
-        [  2,   4,   3,   0,   3,],
-        [  2,   0,   4,   3,   0,]])
-    
-    x = TNHelper.adjm_to_expr(adjm)
-    print(x)
+    #     if verbose:
+    #         return loss
+    #     else:
+    #         return None

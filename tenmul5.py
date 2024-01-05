@@ -247,15 +247,3 @@ class TensorNetwork:
             return loss
         else:
             return None
-        
-
-if __name__ == '__main__':
-    adjm = np.array([
-        [500,   2,   2,   2,   2,],
-        [  2,   0,   3,   4,   0,],
-        [  2,   3,   0,   3,   4,],
-        [  2,   4,   3,   0,   3,],
-        [  2,   0,   4,   3,   0,]])
-    
-    x = TNHelper.adjm_to_expr(adjm)
-    print(x)
