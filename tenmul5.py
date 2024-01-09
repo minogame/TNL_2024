@@ -224,6 +224,7 @@ class TensorNetwork:
         ## This calculate the gradient
         if verbose:
             loss, grad_cores = self.jit_target_retraction_value_gradient(self.cores, target, label)
+            print(self.jit_target_retraction_value_gradient)
         else:
             grad_cores = self.jit_target_retraction_gradient(self.cores, target, label)
             loss = None

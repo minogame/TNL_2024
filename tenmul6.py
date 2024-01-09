@@ -50,7 +50,6 @@ class NCTNHelper:
                 symbol_id += 1
 
         adjm_str = NCTNHelper.to_full(adjm_str)
-        np.fill_diagonal(adjm_str, adjm_diag)
 
         ## in the the NCTN.span_cores, the last dimension is always "batch"
         ## so we append batch to all the shapes, and the retraction result is also batch
@@ -65,18 +64,18 @@ class NCTNHelper:
 
     @staticmethod
     def span_cores(weight, bias, target, activation=jnp.tanh):
-        
         ## target is in shape (batch, feature, dimension)
-        target_splits = np.split(target, target.shape[0], axis=1)
-        return [ activation(jnp.einsum('...s,bs->...b', w, t) + b) for w, b, t in zip(weight, bias, target_splits)]
+        target_splits = jnp.split(target, indices_or_sections=target.shape[1], axis=1)
+        return [ activation(jnp.einsum('...d,b...d->...b', w, t.squeeze()) + jnp.expand_dims(b, -1)) for w, b, t in zip(weight, bias, target_splits)]
     
     @staticmethod
     def expr_shape_feeder(adj_m, target):
         adjm = NCTNHelper.to_full(adj_m)
         np.fill_diagonal(adjm, 0)
-        
-        return [ s[s!=0] for s in np.vsplit(np.c_[adjm, target.shape[0]], adjm.shape[0]) ]
-        
+
+        shape = [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
+        shape = [np.append(s, target.shape[0]) for s in shape]
+        return shape
             
 class NeuroCodingTensorNetwork:
     
@@ -91,10 +90,10 @@ class NeuroCodingTensorNetwork:
         adj_matrix = NCTNHelper.to_full(adj_matrix)
         self.original_adj_matrix = adj_matrix
         adjm = np.copy(adj_matrix)
-        adjm_diag = np.diag(adjm)
+        adjm_diag = np.copy(np.diag(adjm))
         np.fill_diagonal(adjm, 0)
-        B_shapes = [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
         W_shapes = [ s[s!=0] for s in np.vsplit(np.c_[adjm, adjm_diag], adjm.shape[0]) ]
+        B_shapes = [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
         self.W = [initializer(*s) for s in W_shapes]
         self.B = [initializer(*s) for s in B_shapes]
 
@@ -155,41 +154,40 @@ class NeuroCodingTensorNetwork:
         if self.target_retraction(target, optimize, False):
 
             ## change the loss function below
-            def expr_with_mse_loss(W, B, target, activation, label):
-                cores = NCTNHelper.span_cores(W, B, target, activation)
+            def expr_with_mse_loss(W, B, target, label):
+                cores = NCTNHelper.span_cores(W, B, target, self.activation)
                 retract_target_TN = self.einsum_target_expr(*cores)
                 mse_loss = jnp.mean(jnp.square(retract_target_TN - label), axis=0)
 
                 return mse_loss
-        
-            self.jit_target_retraction_gradient = jax.jit(jax.grad(expr_with_mse_loss))
-            self.jit_target_retraction_value_gradient = jax.jit(jax.value_and_grad(expr_with_mse_loss))
-            
+
+            self.jit_target_retraction_gradient = jax.jit(jax.grad(expr_with_mse_loss, argnums=[0, 1]))
+            self.jit_target_retraction_value_gradient = jax.jit(jax.value_and_grad(expr_with_mse_loss, argnums=[0, 1]))
 
         ## This calculate the gradient
-        
         if verbose:
-            loss, grad_cores = self.jit_target_retraction_value_gradient(self.W, self.B, target, self.activation, label)
+            loss, grad_cores = self.jit_target_retraction_value_gradient(self.W, self.B, target, label)
         else:
-            grad_cores = self.jit_target_retraction_gradient(self.W, self.B, target, self.activation, label)
+            grad_cores = self.jit_target_retraction_gradient(self.W, self.B, target, label)
             loss = None
 
         return loss, grad_cores
 
-    # def gradient_descent(self, learning_rate, grad_cores):
-
-    #     ## change this function for different update rules
-    #     for idx, (t, g) in enumerate(zip(self.trainable_list, grad_cores)):
-    #         if t:
-    #             self.cores[idx] -= learning_rate * g
+    def gradient_descent(self, learning_rate, grad_cores):
+        ## change this function for different update rules
+        grad_W, grad_B = grad_cores
+        for idx, (t, gW, gB) in enumerate(zip(self.trainable_list, grad_W, grad_B)):
+            if t:
+                self.W[idx] -= learning_rate * gW
+                self.B[idx] -= learning_rate * gB
         
-    #     return
+        return
 
-    # def iteration(self, learning_rate, target, label, optimize='dp', verbose=False):
-    #     loss, grad_cores = self.target_retraction_grads(target, label, optimize, verbose)
-    #     self.gradient_descent(learning_rate, grad_cores)
+    def iteration(self, learning_rate, target, label, optimize='dp', verbose=False):
+        loss, grad_cores = self.target_retraction_grads(target, label, optimize, verbose)
+        self.gradient_descent(learning_rate, grad_cores)
 
-    #     if verbose:
-    #         return loss
-    #     else:
-    #         return None
+        if verbose:
+            return loss
+        else:
+            return None
