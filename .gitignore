@@ -162,3 +162,4 @@ cython_debug/
 TN_Learning_JAX.py
 TN_Learning.py
 mnist
+mnist.npz

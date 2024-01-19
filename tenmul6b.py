@@ -3,7 +3,7 @@ import opt_einsum
 import numpy as np
 import jax.numpy as jnp
 
-
+    
 class NCTNHelper:
 
     ## The helper class for TensorNetwork,
@@ -36,7 +36,7 @@ class NCTNHelper:
             return np.triu(mat)
 
     @staticmethod
-    def adjm_to_expr(adjm):
+    def adjm_to_expr(adjm, additional_output):
         adjm = NCTNHelper.to_triu(adjm)
         adjm_str = adjm.astype(int).astype(str)
         np.fill_diagonal(adjm_str, '0')
@@ -58,7 +58,15 @@ class NCTNHelper:
             einsum_str.append(''.join([ x for x in a if x.__ne__('0')]) + opt_einsum.get_symbol(0))
 
         adjm_diag = opt_einsum.get_symbol(0)
-        einsum_str = f'{",".join(einsum_str)}->{adjm_diag}'
+        einsum_str_z = []
+        for e, k in zip(einsum_str, additional_output):
+            if k:
+                einsum_str_z.append(opt_einsum.get_symbol(symbol_id)+e)
+                adjm_diag += opt_einsum.get_symbol(symbol_id)
+                symbol_id += 1
+            else:
+                einsum_str_z.append(e)
+        einsum_str = f'{",".join(einsum_str_z)}->{adjm_diag}'
     
         return einsum_str
 
@@ -69,15 +77,24 @@ class NCTNHelper:
         return [ activation(jnp.einsum('...d,b...d->...b', w, t.squeeze()) + jnp.expand_dims(b, -1)) for w, b, t in zip(weight, bias, target_splits)]
     
     @staticmethod
-    def expr_shape_feeder(adj_m, target):
+    def expr_shape_feeder(adj_m, additional_output, target):
         adjm = NCTNHelper.to_full(adj_m)
         np.fill_diagonal(adjm, 0)
 
         shape = [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
         shape = [np.append(s, target.shape[0]) for s in shape]
-        return shape
+        shape_z = []
+        for s, k in zip(shape, additional_output):
+            if k:
+                shape_z.append(np.concatenate([np.array([k]), s]))
+            else:
+                shape_z.append(s)
+        
+        return shape_z
             
 class NeuroCodingTensorNetwork:
+    
+    ## Tenmul6b now has a free leg in a (randomly selected) core
     
     ## In NeuroCodingTensorNetwork, we do the following steps to initlize it.
     ## 1. We need a original shape adj_matrix, with its diagonal elements equal feature dimension.
@@ -86,18 +103,30 @@ class NeuroCodingTensorNetwork:
     ## 4. Create target shape adj_matrix, with its diagonal elements equal batch size.
     ## 5. Create einsum expression and other things.
 
-    def init_cores_weights(self, adj_matrix, initializer) -> None:
+    def init_cores_weights(self, adj_matrix, additional_output, initializer) -> None:
         adj_matrix = NCTNHelper.to_full(adj_matrix)
         self.original_adj_matrix = adj_matrix
+        self.additional_output = additional_output
         adjm = np.copy(adj_matrix)
         adjm_diag = np.copy(np.diag(adjm))
         np.fill_diagonal(adjm, 0)
-        W_shapes = [ s[s!=0] for s in np.vsplit(np.c_[adjm, adjm_diag], adjm.shape[0]) ]
-        B_shapes = [ s[s!=0] for s in np.vsplit(adjm, adjm.shape[0]) ]
+        W_shapes, B_shapes = [], []
+        for s, k in zip(np.vsplit(np.c_[adjm, adjm_diag], adjm.shape[0]), additional_output):
+            if k:
+                W_shapes.append(np.concatenate([np.array([k]), s[s!=0]]))
+            else:
+                W_shapes.append(s[s!=0])
+            
+        for s, k in zip(np.vsplit(adjm, adjm.shape[0]), additional_output):
+            if k:
+                B_shapes.append(np.concatenate([np.array([k]), s[s!=0]]))
+            else:
+                B_shapes.append(s[s!=0])
+
         self.W = [initializer(*s) for s in W_shapes]
         self.B = [initializer(*s) for s in B_shapes]
 
-    def __init__(self, adj_matrix, initializer=None, trainable_list=None, activation=jnp.tanh):
+    def __init__(self, adj_matrix, additional_output=None, initializer=None, trainable_list=None, activation=jnp.tanh):
         self.shape = adj_matrix.shape
         assert self.shape[0] == self.shape[1], 'adj_matrix must be a square matrix.'
         self.dim = self.shape[0]
@@ -110,11 +139,11 @@ class NeuroCodingTensorNetwork:
         if initializer is None:
             initializer = np.random.rand
 
-        self.init_cores_weights(adj_matrix, initializer)
+        self.init_cores_weights(adj_matrix, additional_output, initializer)
 
         ## for the retraction recording
         ## the retraction einsum_str is always the same one desipte input batch size
-        self.einsum_str = NCTNHelper.adjm_to_expr(self.original_adj_matrix)
+        self.einsum_str = NCTNHelper.adjm_to_expr(self.original_adj_matrix, self.additional_output)
         
         self.einsum_target_expr = None
         self.target_shape = None
@@ -134,7 +163,7 @@ class NeuroCodingTensorNetwork:
         if not (self.einsum_target_expr and target.shape == self.target_shape):
             self.target_shape = target.shape
             
-            shapes = NCTNHelper.expr_shape_feeder(self.original_adj_matrix, target)
+            shapes = NCTNHelper.expr_shape_feeder(self.original_adj_matrix, self.additional_output, target)
             self.einsum_target_expr = opt_einsum.contract_expression(self.einsum_str, *shapes, optimize=optimize)
             self.jit_target_retraction = jax.jit(self.einsum_target_expr)
 
@@ -157,7 +186,8 @@ class NeuroCodingTensorNetwork:
             def expr_with_mse_loss(W, B, target, label):
                 cores = NCTNHelper.span_cores(W, B, target, self.activation)
                 retract_target_TN = self.einsum_target_expr(*cores)
-                mse_loss = jnp.mean(jnp.square(retract_target_TN - label), axis=0)
+                mse_loss = jnp.sum(jnp.square(retract_target_TN - label), axis=0)
+                mse_loss = jnp.mean(mse_loss)
 
                 return mse_loss
 
