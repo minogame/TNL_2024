@@ -41,22 +41,29 @@ def reform_dataset(center_crop=24, resize=None):
     
     return x_train, x_test, y_train, y_test
 
-resize = 6
+resize = 8
 x_train, x_test, y_train, y_test = reform_dataset(center_crop=24, resize=resize)
 
 adjm = generate_stupid_large_tensor_ring_adj_matrix(resize**2,4)
 adop = np.zeros((resize**2), dtype=int)
 adop[-1] = 10
-TN = NeuroCodingTensorNetwork(adjm, adop, activation=jnp.tanh, initializer = functools.partial(np.random.normal, loc=0.0, scale=0.4))
+TN = NeuroCodingTensorNetwork(adjm, adop, activation=jnp.tanh, initializer = functools.partial(np.random.normal, loc=0.0, scale=np.sqrt(1.0/5)))
 
 batch_size = 50
-learning_rate = 5e-2
+learning_rate = 3e-1
 
 def train_one_epoch(e):
+    np.random.default_rng().permuted(x_train, axis=0)
     for idx, (x, y) in enumerate(zip(more_itertools.batched(x_train, batch_size), more_itertools.batched(y_train, batch_size))):
         x = np.stack(x, axis=0)
         y = np.stack(y, axis=0)
-        loss = TN.iteration(learning_rate, x, y, optimize='random-greedy-128', verbose=True)
+        if e > 2:
+            lr = learning_rate / 10
+        elif e > 5:
+            lr = learning_rate / 100
+        else:
+            lr = learning_rate
+        loss = TN.iteration(lr, x, y, optimize='random-greedy-128', verbose=True)
         if idx % 50 == 0:
             print(e, idx, loss)
     return

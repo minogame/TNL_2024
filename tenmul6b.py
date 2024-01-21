@@ -200,6 +200,20 @@ class NeuroCodingTensorNetwork:
                 
                 return log_softmax_ce_loss
             
+            def expr_with_softmax_loss_withWD(W, B, target, label):
+                cores = NCTNHelper.span_cores(W, B, target, self.activation)
+                retract_target_TN = self.einsum_target_expr(*cores)
+                logits = jax.nn.softmax(retract_target_TN)
+                log_softmax_ce_loss = -jnp.mean(jnp.sum(jnp.log(logits) * label, axis=-1))
+                
+                WD_loss = 0.0
+                for w in W:
+                    WD_loss += jnp.sum(jnp.square(w)) * 1e-6
+                for b in B:
+                    WD_loss += jnp.sum(jnp.square(b)) * 1e-6
+                
+                return log_softmax_ce_loss + WD_loss
+            
             the_loss = expr_with_softmax_loss
 
             self.jit_target_retraction_gradient = jax.jit(jax.grad(the_loss, argnums=[0, 1]))
