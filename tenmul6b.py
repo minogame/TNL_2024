@@ -2,6 +2,7 @@ import jax
 import opt_einsum
 import numpy as np
 import jax.numpy as jnp
+import functools
 
     
 class NCTNHelper:
@@ -123,8 +124,8 @@ class NeuroCodingTensorNetwork:
             else:
                 B_shapes.append(s[s!=0])
 
-        self.W = [initializer(*s) for s in W_shapes]
-        self.B = [initializer(*s) for s in B_shapes]
+        self.W = [initializer(size=s) for s in W_shapes]
+        self.B = [initializer(size=s) for s in B_shapes]
 
     def __init__(self, adj_matrix, additional_output=None, initializer=None, trainable_list=None, activation=jnp.tanh):
         self.shape = adj_matrix.shape
@@ -137,7 +138,7 @@ class NeuroCodingTensorNetwork:
         self.trainable_list = [int(t) for t in self.trainable_list]
 
         if initializer is None:
-            initializer = np.random.rand
+            initializer = functools.partial(np.random.normal, loc=0.0, scale=1e-5)
 
         self.init_cores_weights(adj_matrix, additional_output, initializer)
 
@@ -190,9 +191,19 @@ class NeuroCodingTensorNetwork:
                 mse_loss = jnp.mean(mse_loss)
 
                 return mse_loss
+            
+            def expr_with_softmax_loss(W, B, target, label):
+                cores = NCTNHelper.span_cores(W, B, target, self.activation)
+                retract_target_TN = self.einsum_target_expr(*cores)
+                logits = jax.nn.softmax(retract_target_TN)
+                log_softmax_ce_loss = -jnp.mean(jnp.sum(jnp.log(logits) * label, axis=-1))
+                
+                return log_softmax_ce_loss
+            
+            the_loss = expr_with_softmax_loss
 
-            self.jit_target_retraction_gradient = jax.jit(jax.grad(expr_with_mse_loss, argnums=[0, 1]))
-            self.jit_target_retraction_value_gradient = jax.jit(jax.value_and_grad(expr_with_mse_loss, argnums=[0, 1]))
+            self.jit_target_retraction_gradient = jax.jit(jax.grad(the_loss, argnums=[0, 1]))
+            self.jit_target_retraction_value_gradient = jax.jit(jax.value_and_grad(the_loss, argnums=[0, 1]))
 
         ## This calculate the gradient
         if verbose:
