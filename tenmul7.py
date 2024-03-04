@@ -117,6 +117,7 @@ class NeuroTNHelper:
 
         # Final Einstein summation expression
         einsum_str = f'{",".join(einsum_str_with_output)}->{str_right_hand_side}'
+        print('einsum_str:', einsum_str)
 
         return einsum_str
     
@@ -196,7 +197,7 @@ class NeuroTNHelper:
         Returns:
         - list of np.ndarray: A list of shapes for each core
         """
-        adjm_full = NeuroTNHelper.to_full(adj_m)
+        adjm_full = NeuroTNHelper.to_full(adj_m).copy()
         external_list = np.diagonal(adjm_full).copy() # the external_list is obtain from the diagonal of adjm.
         np.fill_diagonal(adjm_full, 0)
 
@@ -219,6 +220,7 @@ class NeuroTNHelper:
             else:
                 shapes_final.append(s)
         
+        # print('shapes_final:', shapes_final)
         return shapes_final
     
 class NeuroTN:
@@ -233,7 +235,7 @@ class NeuroTN:
         - initializer (callable): Function to initialize weights and biases, must accept a `size` parameter.
         """
         adj_matrix = NeuroTNHelper.to_full(adj_matrix)
-        self.original_adj_matrix = adj_matrix
+        self.original_adj_matrix = adj_matrix.copy()
         self.additional_output = additional_output
         adjm = np.copy(adj_matrix)
         adjm_diag = np.copy(np.diag(adjm))
@@ -244,7 +246,7 @@ class NeuroTN:
                 W_shapes.append(np.concatenate([np.array([k]), s[s!=0]]))
             else:
                 W_shapes.append(s[s!=0])
-            
+                            
         for s, k in zip(np.vsplit(adjm, adjm.shape[0]), additional_output):
             if k:
                 B_shapes.append(np.concatenate([np.array([k]), s[s!=0]]))
@@ -332,6 +334,7 @@ class NeuroTN:
             self.target_shape = target.shape
             
             shapes = NeuroTNHelper.expr_shape_feeder(self.original_adj_matrix, self.additional_output, target)
+            # print('adjm_orignal', self.original_adj_matrix, 'bingo', target.shape, 'shapes:', shapes)
             self.einsum_target_expr = opt_einsum.contract_expression(self.einsum_str, *shapes, optimize=optimize)
             self.jit_target_contraction = jax.jit(self.einsum_target_expr)
 
@@ -366,25 +369,30 @@ class NeuroTN:
         if self.network_contraction(target, optimize, False):
             ## change the loss function below
             def expr_with_mse_loss(W, B, target, label):
+                label_size = label.shape[0]
                 cores = NeuroTNHelper.core_formulation(W, B, target, self.external_list, self.core_mode, self.activation)
                 contracted_target_TN = self.einsum_target_expr(*cores)
-                mse_loss = jnp.sum(jnp.square(contracted_target_TN - label), axis=0)
+                mse_loss = jnp.sum(jnp.square(contracted_target_TN - label).reshape(label_size, -1), axis=-1)
                 mse_loss = jnp.mean(mse_loss)
 
                 return mse_loss
             
             def expr_with_softmax_loss(W, B, target, label):
+                label_size = label.shape[0]
+                label = label.reshape(label_size, -1)
                 cores = NeuroTNHelper.core_formulation(W, B, target, self.external_list, self.core_mode, self.activation)
                 contracted_target_TN = self.einsum_target_expr(*cores)
-                logits = jax.nn.softmax(contracted_target_TN)
+                logits = jax.nn.softmax(contracted_target_TN).reshape(label_size, -1)
                 log_softmax_ce_loss = -jnp.mean(jnp.sum(jnp.log(logits) * label, axis=-1))
                 
                 return log_softmax_ce_loss
             
             def expr_with_softmax_loss_withWD(W, B, target, label):
+                label_size = label.shape[0]
+                label = label.reshape(label_size, -1)
                 cores = NeuroTNHelper.core_formulation(W, B, target, self.external_list, self.core_mode, self.activation)
                 contracted_target_TN = self.einsum_target_expr(*cores)
-                logits = jax.nn.softmax(contracted_target_TN)
+                logits = jax.nn.softmax(contracted_target_TN).reshape(label_size, -1)
                 log_softmax_ce_loss = -jnp.mean(jnp.sum(jnp.log(logits) * label, axis=-1))
                 
                 WD_loss = 0.0
