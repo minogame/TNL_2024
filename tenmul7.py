@@ -353,6 +353,7 @@ class NeuroTN:
         else:
             return False
         
+        
     def network_contraction_grads(self, target, label, optimize='dp', verbose=False):
         """
         Computes the gradients of the loss function with respect to the weights and biases of the network.
@@ -481,3 +482,30 @@ class NeuroTN:
             return loss
         else:
             return None
+    
+    def ntk(self, target, opt_path='db'):
+        dim_output = jnp.prod(self.additional_output[self.additional_output != 0])
+
+        def network_model(W, B, target):
+                cores = NeuroTNHelper.core_formulation(W, B, target, self.external_list, self.core_mode, self.activation)
+                return self.einsum_target_expr(*cores)
+        
+        self.network_contraction(target, optimize=opt_path, return_contraction=False)
+        
+        jac_W, jac_B = jax.jit(jax.jacfwd(network_model, argnums=[0, 1]))(self.W, self.B, target)
+        
+        ntk_tensor = jnp.zeros((target.shape[0], target.shape[0]))
+        
+        @jax.jit
+        def process_tensor(tensor):
+            tensor_plain = tensor.reshape(tensor.shape[0], dim_output, -1).swapaxes(0, 1)
+            return jnp.matmul(tensor_plain, tensor_plain.swapaxes(1, 2))
+                
+        for w in jac_W:
+            ntk_tensor += process_tensor(w)
+        
+        if self.core_mode != 2:  # Mode 2 means no bias
+            for b in jac_B:
+                ntk_tensor += process_tensor(b)
+
+        return ntk_tensor
