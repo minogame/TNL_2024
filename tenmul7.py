@@ -117,7 +117,7 @@ class NeuroTNHelper:
 
         # Final Einstein summation expression
         einsum_str = f'{",".join(einsum_str_with_output)}->{str_right_hand_side}'
-        print('einsum_str:', einsum_str)
+        # print('einsum_str:', einsum_str)
 
         return einsum_str
     
@@ -334,7 +334,9 @@ class NeuroTN:
             self.target_shape = target.shape
             
             shapes = NeuroTNHelper.expr_shape_feeder(self.original_adj_matrix, self.additional_output, target)
-            # print('adjm_orignal', self.original_adj_matrix, 'bingo', target.shape, 'shapes:', shapes)
+            # print('adjm_orignal\n', self.original_adj_matrix, '\ntarget_shape:\n', target.shape, '\nshapes:\n', shapes)
+            # print('\nesinsum_str:', self.einsum_str)
+            # print('\noptimize:', optimize)
             self.einsum_target_expr = opt_einsum.contract_expression(self.einsum_str, *shapes, optimize=optimize)
             self.jit_target_contraction = jax.jit(self.einsum_target_expr)
 
@@ -483,7 +485,7 @@ class NeuroTN:
         else:
             return None
     
-    def ntk(self, target, opt_path='db'):
+    def ntk(self, target, opt_path='dp'):
         dim_output = jnp.prod(self.additional_output[self.additional_output != 0])
 
         def network_model(W, B, target):
@@ -492,7 +494,8 @@ class NeuroTN:
         
         self.network_contraction(target, optimize=opt_path, return_contraction=False)
         
-        jac_W, jac_B = jax.jit(jax.jacfwd(network_model, argnums=[0, 1]))(self.W, self.B, target)
+        # jac_W, jac_B = jax.jit(jax.jacfwd(network_model, argnums=[0, 1]))(self.W, self.B, target)
+        jac_W, jac_B = jax.jacrev(network_model, argnums=[0, 1])(self.W, self.B, target)
         
         ntk_tensor = jnp.zeros((target.shape[0], target.shape[0]))
         
